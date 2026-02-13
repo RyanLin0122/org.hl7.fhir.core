@@ -18,6 +18,8 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -675,22 +677,25 @@ public class BundleValidator extends BaseValidator {
   private boolean checkAllInterlinked(List<ValidationMessage> errors, List<Element> entries, NodeStack stack, Element bundle, boolean isMessage) {
     boolean ok = true;
     List<EntrySummary> entryList = new ArrayList<>();
+    Map<Element, EntrySummary> entrySummaryMap = new IdentityHashMap<>();
+    Map<Element, List<StringWithSource>> referenceMemo = new IdentityHashMap<>();
     int i = 0;
     for (Element entry : entries) {
       Element r = entry.getNamedChild(RESOURCE, false);
       if (r != null) {
         EntrySummary e = new EntrySummary(i, entry, r);
         entryList.add(e);
+        entrySummaryMap.put(entry, e);
       }
       i++;
     }
 
     for (EntrySummary e : entryList) {
-      List<StringWithSource> references = findReferences(e.getEntry());
+      List<StringWithSource> references = findReferences(e.getEntry(), referenceMemo);
       for (StringWithSource ref : references) {
         Element tgt = resolveInBundle(bundle, entries, ref.getReference(), e.getEntry().getChildValue(FULL_URL), e.getResource().fhirType(), e.getResource().getIdBase(), stack, errors, ref.getSource().getPath(), ref.getSource(), ref.isWarning() || true, ref.isNlLink());
         if (tgt != null) { 
-          EntrySummary t = entryForTarget(entryList, tgt); 
+          EntrySummary t = entryForTarget(entrySummaryMap, tgt); 
           if (t != null ) { 
             if (t != e) { 
               e.getTargets().add(t); 
@@ -830,13 +835,8 @@ public class BundleValidator extends BaseValidator {
     }
   }
 
-  private EntrySummary entryForTarget(List<EntrySummary> entryList, Element tgt) {
-    for (EntrySummary e : entryList) {
-      if (e.getEntry() == tgt) {
-        return e;
-      }
-    }
-    return null;
+  private EntrySummary entryForTarget(Map<Element, EntrySummary> entrySummaryMap, Element tgt) {
+    return entrySummaryMap.get(tgt);
   }
 
   private void visitLinked(Set<EntrySummary> visited, EntrySummary t) {
@@ -877,29 +877,50 @@ public class BundleValidator extends BaseValidator {
 
 
   private List<StringWithSource> findReferences(Element start) {
-    List<StringWithSource> references = new ArrayList<StringWithSource>();
-    findReferences(start, references);
+    return findReferences(start, null);
+  }
+
+  private List<StringWithSource> findReferences(Element start, Map<Element, List<StringWithSource>> referenceMemo) {
+    if (referenceMemo != null) {
+      List<StringWithSource> cachedReferences = referenceMemo.get(start);
+      if (cachedReferences != null) {
+        return cachedReferences;
+      }
+    }
+    List<StringWithSource> references = new ArrayList<>();
+    Set<String> seenReferences = new LinkedHashSet<>();
+    findReferences(start, references, seenReferences, referenceMemo);
+    if (referenceMemo != null) {
+      referenceMemo.put(start, references);
+    }
     return references;
   }
 
-  private void findReferences(Element start, List<StringWithSource> references) {
+  private void findReferences(Element start, List<StringWithSource> references, Set<String> seenReferences, Map<Element, List<StringWithSource>> referenceMemo) {
     for (Element child : start.getChildren()) {
       if (child.getType().equals("Reference")) {
         String ref = child.getChildValue("reference");
-        if (ref != null && !ref.startsWith("#") && !hasReference(ref, references))
+        if (ref != null && !ref.startsWith("#") && seenReferences.add(ref)) {
           references.add(new StringWithSource(ref, child, false, false));
+        }
       }
       if (Utilities.existsInList(child.getType(), "url", "uri"/*, "canonical"*/) &&
           !Utilities.existsInList(child.getName(), "system") &&
           !Utilities.existsInList(child.getProperty().getDefinition().getPath(), "Bundle.entry.fullUrl", "Coding.system",  "Identifier.system", "Meta.profile", "Extension.url", "Quantity.system",
               "MessageHeader.source.endpoint", "MessageHeader.destination.endpoint", "Endpoint.address")) {
         String ref = child.primitiveValue();
-        if (ref != null && !ref.startsWith("#") && !hasReference(ref, references))
+        if (ref != null && !ref.startsWith("#") && seenReferences.add(ref)) {
           references.add(new StringWithSource(ref, child, true, isNLLink(start)));
+        }
       }
       // don't walk into a sub-bundle 
       if (!"Bundle".equals(child.fhirType())) {
-        findReferences(child, references);
+        List<StringWithSource> nestedReferences = findReferences(child, referenceMemo);
+        for (StringWithSource nested : nestedReferences) {
+          if (seenReferences.add(nested.getReference())) {
+            references.add(nested);
+          }
+        }
       }
     }
   }
@@ -907,15 +928,6 @@ public class BundleValidator extends BaseValidator {
 
   private boolean isNLLink(Element parent) {
     return parent != null && "extension".equals(parent.getName()) && "http://hl7.org/fhir/StructureDefinition/narrativeLink".equals(parent.getNamedChildValue("url", false));
-  }
-
-  private boolean hasReference(String ref, List<StringWithSource> references) {
-    for (StringWithSource t : references) {
-      if (ref.equals(t.getReference())) {
-        return true;
-      }
-    }
-    return false;
   }
 
   // hack for pre-UTG v2/v3
